@@ -101,7 +101,7 @@ object MiBand4Crypto {
         }
 
         val packet = ByteArray(2 + EXPECTED_KEY_LENGTH)
-        packet[0] = AUTH_SEND_ENCRYPTED_AUTH_NUMBER_FLAG
+        packet[0] = MiBandConstants.AUTH_SEND_ENCRYPTED_AUTH_NUMBER_FLAG
         packet[1] = 0x00
         System.arraycopy(encryptedChallenge, 0, packet, 2, EXPECTED_KEY_LENGTH)
         return packet
