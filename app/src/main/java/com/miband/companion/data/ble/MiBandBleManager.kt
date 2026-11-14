@@ -31,8 +31,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
-import javax.crypto.Cipher
-import javax.crypto.spec.SecretKeySpec
 
 sealed class ConnectionState {
     object Disconnected : ConnectionState()
@@ -50,25 +48,49 @@ class MiBandBleManager(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
 
+    private data class HandshakeSequence(
+        val name: String,
+        val preCommand: ByteArray?,      // Опционально 0100 или 0181 перед 820002
+        val authReq: ByteArray,          // 820002 или 0200
+        val authRespHeader: ByteArray    // 8300 или 0300
+    )
+
+    private val sequences = listOf(
+        HandshakeSequence(
+            name = "820002->8300",
+            preCommand = null,
+            authReq = byteArrayOf(0x82.toByte(), 0x00, 0x02),
+            authRespHeader = byteArrayOf(0x83.toByte(), 0x00)
+        ),
+        HandshakeSequence(
+            name = "0100->820002->8300",
+            preCommand = byteArrayOf(0x01, 0x00),
+            authReq = byteArrayOf(0x82.toByte(), 0x00, 0x02),
+            authRespHeader = byteArrayOf(0x83.toByte(), 0x00)
+        ),
+        HandshakeSequence(
+            name = "0181->820002->8300",
+            preCommand = byteArrayOf(0x01, 0x81.toByte()),
+            authReq = byteArrayOf(0x82.toByte(), 0x00, 0x02),
+            authRespHeader = byteArrayOf(0x83.toByte(), 0x00)
+        ),
+        HandshakeSequence(
+            name = "0200->0300",
+            preCommand = null,
+            authReq = byteArrayOf(0x02, 0x00),
+            authRespHeader = byteArrayOf(0x03, 0x00)
+        )
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val gattQueue = BleGattQueue(dispatcher)
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var reconnectJob: Job? = null
     private var discoveryRetryDone = false
+    private var sequenceIndex = 0
     private var forcePairMode = false
     private var authRejectedStopReconnect = false
-
-    // Состояние поиска протокола 01 81 -> 82 00 -> 83 00
-    private var init0181Index = 0
-    private var sessionCandidateIndex = 0
-    private var sessionSaltA: ByteArray? = null
-
-    private val init0181Requests = listOf(
-        "0181 (2b)" to byteArrayOf(0x01, 0x81.toByte()),
-        "018100 (3b)" to byteArrayOf(0x01, 0x81.toByte(), 0x00),
-        "0181+zeros (18b)" to (byteArrayOf(0x01, 0x81.toByte()) + ByteArray(16))
-    )
 
     private var targetDeviceAddress: String? = null
     private var authKeyHex: String = MiBandConstants.DEFAULT_AUTH_KEY_HEX
@@ -96,7 +118,6 @@ class MiBandBleManager(
     companion object {
         private const val TAG = "MiBandBleManager"
         private const val RECONNECT_DELAY_MS = 4000L
-        private const val TOTAL_SESSION_CANDIDATES = 5
     }
 
     private fun logBle(message: String) {
@@ -131,9 +152,7 @@ class MiBandBleManager(
         }
 
         discoveryRetryDone = false
-        init0181Index = 0
-        sessionCandidateIndex = 0
-        sessionSaltA = null
+        sequenceIndex = 0
         _connectionState.value = ConnectionState.Connecting
         val keyPreview = "${authKeyHex.take(4)}...${authKeyHex.takeLast(4)}"
         logBle("Connect -> $macAddress (key=$keyPreview)")
@@ -323,7 +342,7 @@ class MiBandBleManager(
         if (forcePairMode) {
             sendPairKeyPacket(gatt, authChar)
         } else {
-            sendNext0181Request(gatt, authChar)
+            runCurrentSequence(gatt, authChar)
         }
     }
 
@@ -346,41 +365,39 @@ class MiBandBleManager(
         }
     }
 
-    private suspend fun sendNext0181Request(
+    private suspend fun runCurrentSequence(
         gatt: BluetoothGatt,
         authChar: BluetoothGattCharacteristic
     ) {
-        if (init0181Index >= init0181Requests.size) {
-            logBle("ERR: Ни один запрос 0181 не принят")
+        if (sequenceIndex >= sequences.size) {
+            logBle("ERR: Все сценарии рукопожатия исчерпаны")
             authRejectedStopReconnect = true
             targetDeviceAddress = null
-            _connectionState.value = ConnectionState.Error("Команда 0181 отклонена браслетом")
+            _connectionState.value = ConnectionState.Error("Рукопожатие отклонено (код 8)")
             return
         }
-        val (label, cmd) = init0181Requests[init0181Index]
-        logBle("TX [$label]: ${MiBand4Crypto.bytesToHex(cmd)}")
-        val ok = gattQueue.writeCharacteristic(gatt, authChar, cmd)
-        if (!ok) {
-            scheduleReconnect("Write 0181 fail")
+
+        val seq = sequences[sequenceIndex]
+        if (seq.preCommand != null) {
+            logBle("TX Pre [${seq.name}]: ${MiBand4Crypto.bytesToHex(seq.preCommand)}")
+            val ok = gattQueue.writeCharacteristic(gatt, authChar, seq.preCommand)
+            if (!ok) {
+                scheduleReconnect("Pre write fail")
+            }
+        } else {
+            sendAuthReq(gatt, authChar, seq)
         }
     }
 
-    private suspend fun sendChallengeRequest8200(
+    private suspend fun sendAuthReq(
         gatt: BluetoothGatt,
-        authChar: BluetoothGattCharacteristic
+        authChar: BluetoothGattCharacteristic,
+        seq: HandshakeSequence
     ) {
-        if (sessionCandidateIndex >= TOTAL_SESSION_CANDIDATES) {
-            logBle("ERR: Все 5 формул сессионного ключа отклонены")
-            authRejectedStopReconnect = true
-            targetDeviceAddress = null
-            _connectionState.value = ConnectionState.Error("Сессионный ключ 0181 не подошёл")
-            return
-        }
-        val cmd = byteArrayOf(0x82.toByte(), 0x00)
-        logBle("TX [cand=$sessionCandidateIndex]: 8200")
-        val ok = gattQueue.writeCharacteristic(gatt, authChar, cmd)
+        logBle("TX Req [${seq.name}]: ${MiBand4Crypto.bytesToHex(seq.authReq)}")
+        val ok = gattQueue.writeCharacteristic(gatt, authChar, seq.authReq)
         if (!ok) {
-            scheduleReconnect("Write 8200 fail")
+            scheduleReconnect("Req write fail")
         }
     }
 
@@ -406,20 +423,18 @@ class MiBandBleManager(
         val authChar = gatt.getService(MiBandConstants.UUID_SERVICE_AUTH)
             ?.getCharacteristic(MiBandConstants.UUID_CHAR_AUTH) ?: return
 
-        // Обработка ответа на 01 81: формат [10, 01, 81, status, ...16 байт...]
-        if (data[1] == 0x01.toByte() && data.size >= 4 && data[2] == 0x81.toByte()) {
-            val status0181 = data[3]
-            if (status0181 == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS && data.size >= 20) {
-                val salt = ByteArray(16)
-                System.arraycopy(data, 4, salt, 0, 16)
-                sessionSaltA = salt
-                sessionCandidateIndex = 0
-                logBle("OK 0181! Получена соль (16b): ${MiBand4Crypto.bytesToHex(salt)}")
-                scope.launch { sendChallengeRequest8200(gatt, authChar) }
+        val seq = sequences.getOrNull(sequenceIndex) ?: return
+
+        // Ответ на preCommand (0100 или 0181): 10018101... или 100104
+        if (data[1] == 0x01.toByte()) {
+            if (forcePairMode && data[2] == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS) {
+                logBle("Ключ принят! Запрос 820002...")
+                forcePairMode = false
+                sequenceIndex = 0
+                scope.launch { sendAuthReq(gatt, authChar, sequences[0]) }
             } else {
-                logBle("0181[${init0181Index}] отклонён (status=$status0181)")
-                init0181Index++
-                scope.launch { sendNext0181Request(gatt, authChar) }
+                // После ответа на preCommand отправляем authReq (820002)
+                scope.launch { sendAuthReq(gatt, authChar, seq) }
             }
             return
         }
@@ -427,109 +442,53 @@ class MiBandBleManager(
         val commandOpcode = (data[1].toInt() and 0x7F).toByte()
         val statusCode = data[2]
 
-        if (commandOpcode == 0x01.toByte()) {
-            if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS) {
-                logBle("Ключ принят! Запрос 8200...")
-                forcePairMode = false
-                scope.launch { sendChallengeRequest8200(gatt, authChar) }
-            } else {
-                authRejectedStopReconnect = true
-                _connectionState.value = ConnectionState.Error("Привязка отклонена ($statusCode)")
-            }
-            return
-        }
-
         if (commandOpcode == 0x02.toByte()) {
             if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS && data.size >= 19) {
-                val challengeR = ByteArray(16)
-                System.arraycopy(data, 3, challengeR, 0, 16)
+                val challenge = ByteArray(16)
+                System.arraycopy(data, 3, challenge, 0, 16)
 
                 scope.launch {
                     try {
-                        val authKey = MiBand4Crypto.hexStringToByteArray(authKeyHex)
-                        val saltA = sessionSaltA ?: ByteArray(16)
-                        val encryptedResp = computeSessionResponse(
-                            candidate = sessionCandidateIndex,
-                            authKey = authKey,
-                            saltA = saltA,
-                            challengeR = challengeR
-                        )
+                        val keyBytes = MiBand4Crypto.hexStringToByteArray(authKeyHex)
+                        val encrypted = MiBand4Crypto.encryptChallenge(challenge, keyBytes)
 
-                        val packet = ByteArray(2 + encryptedResp.size)
-                        packet[0] = 0x83.toByte()
-                        packet[1] = 0x00
-                        System.arraycopy(encryptedResp, 0, packet, 2, encryptedResp.size)
+                        val packet = ByteArray(2 + encrypted.size)
+                        packet[0] = seq.authRespHeader[0]
+                        packet[1] = seq.authRespHeader[1]
+                        System.arraycopy(encrypted, 0, packet, 2, encrypted.size)
 
-                        logBle("TX Enc [cand=$sessionCandidateIndex]: ${MiBand4Crypto.bytesToHex(packet)}")
+                        logBle("TX Resp [${seq.name}]: ${MiBand4Crypto.bytesToHex(packet)}")
                         gattQueue.writeCharacteristic(gatt, authChar, packet)
                     } catch (e: GeneralSecurityException) {
                         logBle("ERR AES: ${e.message}")
                         _connectionState.value = ConnectionState.Error("Ошибка AES")
+                    } catch (e: IllegalArgumentException) {
+                        logBle("ERR Key: ${e.message}")
+                        _connectionState.value = ConnectionState.Error("Неверный формат Auth Key")
                     }
                 }
             } else {
-                logBle("8200 отклонён ($statusCode)")
-                authRejectedStopReconnect = true
-                _connectionState.value = ConnectionState.Error("Challenge 8200 отклонён ($statusCode)")
+                logBle("Сценарий [${seq.name}] отклонён на 0x02 ($statusCode)")
+                sequenceIndex++
+                scope.launch { runCurrentSequence(gatt, authChar) }
             }
             return
         }
 
         if (commandOpcode == 0x03.toByte()) {
             if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS) {
-                logBle("АВТОРИЗАЦИЯ ПРОЙДЕНА (cand=$sessionCandidateIndex)!")
+                logBle("АВТОРИЗАЦИЯ ПРОЙДЕНА на [${seq.name}]!")
                 authRejectedStopReconnect = false
                 _connectionState.value = ConnectionState.Authenticated
                 scope.launch {
                     onHandshakeCompleted(gatt)
                 }
             } else {
-                logBle("cand=$sessionCandidateIndex отклонён на 8300 (status=$statusCode)")
-                sessionCandidateIndex++
-                scope.launch { sendChallengeRequest8200(gatt, authChar) }
+                logBle("Сценарий [${seq.name}] отклонён на 0x03 ($statusCode)")
+                sequenceIndex++
+                scope.launch { runCurrentSequence(gatt, authChar) }
             }
         }
-    }
-
-    /**
-     * Проверяет криптографические способы получения ответа для 8300 из соли 0181 и challenge 8200.
-     */
-    private fun computeSessionResponse(
-        candidate: Int,
-        authKey: ByteArray,
-        saltA: ByteArray,
-        challengeR: ByteArray
-    ): ByteArray {
-        return when (candidate) {
-            // 0: saltA = AES_ENC(authKey, sessionKey) -> расшифровываем sessionKey и шифруем challengeR
-            0 -> {
-                val sessionKey = aesEcb(Cipher.DECRYPT_MODE, authKey, saltA)
-                aesEcb(Cipher.ENCRYPT_MODE, sessionKey, challengeR)
-            }
-            // 1: sessionKey = AES_ENC(authKey, saltA) -> шифруем challengeR сессионным ключом
-            1 -> {
-                val sessionKey = aesEcb(Cipher.ENCRYPT_MODE, authKey, saltA)
-                aesEcb(Cipher.ENCRYPT_MODE, sessionKey, challengeR)
-            }
-            // 2: 0181 только разблокировал режим 82/83, шифрование идёт напрямую через authKey
-            2 -> aesEcb(Cipher.ENCRYPT_MODE, authKey, challengeR)
-            // 3: XOR challenge с saltA перед шифрованием authKey
-            3 -> {
-                val xored = ByteArray(16) { i -> (challengeR[i].toInt() xor saltA[i].toInt()).toByte() }
-                aesEcb(Cipher.ENCRYPT_MODE, authKey, xored)
-            }
-            // 4: XOR authKey с saltA как сессионный ключ
-            else -> {
-                val sessionKey = ByteArray(16) { i -> (authKey[i].toInt() xor saltA[i].toInt()).toByte() }
-                aesEcb(Cipher.ENCRYPT_MODE, sessionKey, challengeR)
-            }
-        }
-    }
-
-    private fun aesEcb(mode: Int, key: ByteArray, input: ByteArray): ByteArray {
-        val cipher = Cipher.getInstance("AES/ECB/NoPadding")
-        cipher.init(mode, SecretKeySpec(key, "AES"))
-        return cipher.doFinal(input)
     }
 
     private suspend fun onHandshakeCompleted(gatt: BluetoothGatt) {
