@@ -48,13 +48,30 @@ class MiBandBleManager(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
 
+    private data class AuthVariant(
+        val name: String,
+        val reqBytes: ByteArray,
+        val respByte0: Byte,
+        val respByte1: Byte
+    )
+
+    private val authVariants = listOf(
+        AuthVariant("0200->0300", byteArrayOf(0x02, 0x00), 0x03, 0x00),
+        AuthVariant("020002->0300", byteArrayOf(0x02, 0x00, 0x02), 0x03, 0x00),
+        AuthVariant("0200->0380", byteArrayOf(0x02, 0x00), 0x03, 0x80.toByte()),
+        AuthVariant("0280->0380", byteArrayOf(0x02, 0x80.toByte()), 0x03, 0x80.toByte()),
+        AuthVariant("8200->8300", byteArrayOf(0x82.toByte(), 0x00), 0x83.toByte(), 0x00),
+        AuthVariant("020002->0380", byteArrayOf(0x02, 0x00, 0x02), 0x03, 0x80.toByte()),
+        AuthVariant("0208->0308", byteArrayOf(0x02, 0x08), 0x03, 0x08)
+    )
+
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val gattQueue = BleGattQueue(dispatcher)
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var reconnectJob: Job? = null
     private var discoveryRetryDone = false
-    private var activeAuthFlag: Byte = 0x00
+    private var authVariantIndex = 0
     private var forcePairMode = false
     private var authRejectedStopReconnect = false
 
@@ -118,10 +135,10 @@ class MiBandBleManager(
         }
 
         discoveryRetryDone = false
-        activeAuthFlag = 0x00
+        authVariantIndex = 0
         _connectionState.value = ConnectionState.Connecting
         val keyPreview = "${authKeyHex.take(4)}...${authKeyHex.takeLast(4)}"
-        logBle("Connect -> $macAddress (key=$keyPreview, pair=$forcePair)")
+        logBle("Connect -> $macAddress (key=$keyPreview)")
 
         bluetoothGatt = device.connectGatt(
             context,
@@ -165,7 +182,7 @@ class MiBandBleManager(
 
     private fun scheduleReconnect(reason: String) {
         if (authRejectedStopReconnect) {
-            logBle("Автореконнект остановлен: требуется верный ключ")
+            logBle("Реконнект остановлен (auth rejected)")
             return
         }
         val address = targetDeviceAddress ?: return
@@ -306,29 +323,24 @@ class MiBandBleManager(
         }
 
         if (forcePairMode) {
-            sendPairKeyPacket(gatt, authChar, 0x00)
+            sendPairKeyPacket(gatt, authChar)
         } else {
-            sendChallengeRequest(gatt, authChar, 0x00)
+            sendCurrentChallengeRequest(gatt, authChar)
         }
     }
 
-    /**
-     * Отправка команды привязки [0x01, flag, ...16 байт Auth Key...] (требует тапа на экране браслета).
-     */
     private suspend fun sendPairKeyPacket(
         gatt: BluetoothGatt,
-        authChar: BluetoothGattCharacteristic,
-        flag: Byte
+        authChar: BluetoothGattCharacteristic
     ) {
-        activeAuthFlag = flag
         try {
             val keyBytes = MiBand4Crypto.hexStringToByteArray(authKeyHex)
             val packet = ByteArray(2 + keyBytes.size)
             packet[0] = 0x01
-            packet[1] = flag
+            packet[1] = 0x00
             System.arraycopy(keyBytes, 0, packet, 2, keyBytes.size)
 
-            logBle("TX PairKey (18b, flag=$flag) — подтвердите на браслете!")
+            logBle("TX PairKey (18b)")
             gattQueue.writeCharacteristic(gatt, authChar, packet)
         } catch (e: Exception) {
             logBle("ERR PairKey: ${e.message}")
@@ -336,17 +348,23 @@ class MiBandBleManager(
         }
     }
 
-    private suspend fun sendChallengeRequest(
+    private suspend fun sendCurrentChallengeRequest(
         gatt: BluetoothGatt,
-        authChar: BluetoothGattCharacteristic,
-        flag: Byte
+        authChar: BluetoothGattCharacteristic
     ) {
-        activeAuthFlag = flag
-        val cmd = byteArrayOf(0x02, flag)
-        logBle("TX Auth: ${MiBand4Crypto.bytesToHex(cmd)}")
-        val ok = gattQueue.writeCharacteristic(gatt, authChar, cmd)
+        if (authVariantIndex >= authVariants.size) {
+            logBle("ERR: Все варианты флагов исчерпаны")
+            authRejectedStopReconnect = true
+            targetDeviceAddress = null
+            _connectionState.value = ConnectionState.Error("Все варианты рукопожатия отклонены")
+            return
+        }
+
+        val variant = authVariants[authVariantIndex]
+        logBle("TX [${variant.name}]: ${MiBand4Crypto.bytesToHex(variant.reqBytes)}")
+        val ok = gattQueue.writeCharacteristic(gatt, authChar, variant.reqBytes)
         if (!ok) {
-            logBle("ERR: Сбой TX Auth")
+            logBle("ERR: Сбой TX [${variant.name}]")
             scheduleReconnect("Write challenge fail")
         }
     }
@@ -370,25 +388,20 @@ class MiBandBleManager(
         if (data.size < 3) return
 
         val responseHeader = data[0]
-        val commandOpcode = data[1]
+        val commandOpcode = (data[1].toInt() and 0x7F).toByte()
         val statusCode = data[2]
 
         if (responseHeader != MiBandConstants.AUTH_RESPONSE_HEADER) return
 
-        // Ответ на запись нового ключа (0x01)
-        if (commandOpcode == 0x01.toByte()) {
-            val authChar = gatt.getService(MiBandConstants.UUID_SERVICE_AUTH)
-                ?.getCharacteristic(MiBandConstants.UUID_CHAR_AUTH) ?: return
+        val authChar = gatt.getService(MiBandConstants.UUID_SERVICE_AUTH)
+            ?.getCharacteristic(MiBandConstants.UUID_CHAR_AUTH) ?: return
 
+        if (commandOpcode == 0x01.toByte()) {
             if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS) {
-                logBle("Ключ принят браслетом! Запрос challenge...")
+                logBle("Ключ принят! Запрос challenge...")
                 forcePairMode = false
-                scope.launch {
-                    sendChallengeRequest(gatt, authChar, activeAuthFlag)
-                }
-            } else if (activeAuthFlag == 0x00.toByte()) {
-                logBle("PairKey flag=0x00 код $statusCode, пробуем 0x08...")
-                scope.launch { sendPairKeyPacket(gatt, authChar, 0x08) }
+                authVariantIndex = 0
+                scope.launch { sendCurrentChallengeRequest(gatt, authChar) }
             } else {
                 authRejectedStopReconnect = true
                 _connectionState.value = ConnectionState.Error("Привязка отклонена ($statusCode)")
@@ -396,23 +409,24 @@ class MiBandBleManager(
             return
         }
 
-        // Ответ на запрос challenge (0x02)
         if (commandOpcode == 0x02.toByte()) {
-            val authChar = gatt.getService(MiBandConstants.UUID_SERVICE_AUTH)
-                ?.getCharacteristic(MiBandConstants.UUID_CHAR_AUTH) ?: return
-
             if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS && data.size >= 19) {
                 val challenge = ByteArray(16)
                 System.arraycopy(data, 3, challenge, 0, 16)
+                val variant = authVariants[authVariantIndex]
 
                 scope.launch {
                     try {
                         val keyBytes = MiBand4Crypto.hexStringToByteArray(authKeyHex)
                         val encryptedChallenge = MiBand4Crypto.encryptChallenge(challenge, keyBytes)
-                        val responsePacket = MiBand4Crypto.buildAuthResponsePacket(encryptedChallenge, activeAuthFlag)
 
-                        logBle("TX Encrypted (18b, flag=$activeAuthFlag)")
-                        gattQueue.writeCharacteristic(gatt, authChar, responsePacket)
+                        val packet = ByteArray(2 + encryptedChallenge.size)
+                        packet[0] = variant.respByte0
+                        packet[1] = variant.respByte1
+                        System.arraycopy(encryptedChallenge, 0, packet, 2, encryptedChallenge.size)
+
+                        logBle("TX Enc [${variant.name}]: ${MiBand4Crypto.bytesToHex(packet)}")
+                        gattQueue.writeCharacteristic(gatt, authChar, packet)
                     } catch (e: GeneralSecurityException) {
                         logBle("ERR AES: ${e.message}")
                         _connectionState.value = ConnectionState.Error("Ошибка AES шифрования")
@@ -421,42 +435,26 @@ class MiBandBleManager(
                         _connectionState.value = ConnectionState.Error("Неверный формат Auth Key")
                     }
                 }
-            } else if (activeAuthFlag == 0x00.toByte()) {
-                logBle("Challenge flag=0x00 отклонён ($statusCode), пробуем 0x08...")
-                scope.launch { sendChallengeRequest(gatt, authChar, 0x08) }
             } else {
-                authRejectedStopReconnect = true
-                _connectionState.value = ConnectionState.Error("Challenge отклонён ($statusCode)")
+                logBle("Вариант ${authVariants[authVariantIndex].name} отклонён на 0x02 ($statusCode)")
+                authVariantIndex++
+                scope.launch { sendCurrentChallengeRequest(gatt, authChar) }
             }
             return
         }
 
-        // Ответ на зашифрованный challenge (0x03)
-        if (commandOpcode == MiBandConstants.AUTH_SEND_ENCRYPTED_AUTH_NUMBER_FLAG) {
+        if (commandOpcode == 0x03.toByte()) {
             if (statusCode == MiBandConstants.AUTH_RESPONSE_STATUS_SUCCESS) {
-                logBle("АВТОРИЗАЦИЯ ПРОЙДЕНА!")
+                logBle("АВТОРИЗАЦИЯ ПРОЙДЕНА на [${authVariants[authVariantIndex].name}]!")
                 authRejectedStopReconnect = false
                 _connectionState.value = ConnectionState.Authenticated
                 scope.launch {
                     onHandshakeCompleted(gatt)
                 }
-            } else if (activeAuthFlag == 0x00.toByte()) {
-                // Важно: многие прошивки Mi Band 4 принимают 0200, но отклоняют 0300 с кодом 08 — пробуем 0208 -> 0308!
-                logBle("Ответ 0300 отклонён ($statusCode), переключаемся на flag=0x08...")
-                scope.launch {
-                    val authChar = gatt.getService(MiBandConstants.UUID_SERVICE_AUTH)
-                        ?.getCharacteristic(MiBandConstants.UUID_CHAR_AUTH)
-                    if (authChar != null) {
-                        sendChallengeRequest(gatt, authChar, 0x08)
-                    }
-                }
             } else {
-                logBle("ERR Ключ отклонён на обоих флагах (0x00 и 0x08), код: $statusCode")
-                authRejectedStopReconnect = true
-                targetDeviceAddress = null
-                _connectionState.value = ConnectionState.Error(
-                    "Ключ не подошёл (код $statusCode). Нужен актуальный Auth Key или привязка 0x01."
-                )
+                logBle("Вариант ${authVariants[authVariantIndex].name} отклонён на 0x03 ($statusCode)")
+                authVariantIndex++
+                scope.launch { sendCurrentChallengeRequest(gatt, authChar) }
             }
         }
     }
