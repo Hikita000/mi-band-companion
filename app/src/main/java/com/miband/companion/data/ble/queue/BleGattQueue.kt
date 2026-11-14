@@ -1,5 +1,6 @@
 package com.miband.companion.data.ble.queue
 
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
@@ -15,8 +16,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Потокобезопасная последовательная очередь GATT-операций.
- * Предотвращает ошибки BLE-стека Android, вызванные одновременными асинхронными вызовами.
+ * Автоматически согласовывает допустимый writeType для каждой характеристики.
  */
+@SuppressLint("MissingPermission")
 class BleGattQueue(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
@@ -29,9 +31,6 @@ class BleGattQueue(
         private const val DEFAULT_TIMEOUT_MS = 5000L
     }
 
-    /**
-     * Помещает операцию записи дескриптора в очередь и приостанавливает вызов до завершения onDescriptorWrite.
-     */
     suspend fun writeDescriptor(
         gatt: BluetoothGatt,
         descriptor: BluetoothGattDescriptor,
@@ -43,6 +42,9 @@ class BleGattQueue(
 
             val initiated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val status = gatt.writeDescriptor(descriptor, payload)
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "writeDescriptor вернул код: $status")
+                }
                 status == BluetoothGatt.GATT_SUCCESS
             } else {
                 @Suppress("DEPRECATION")
@@ -52,7 +54,6 @@ class BleGattQueue(
             }
 
             if (!initiated) {
-                Log.e(TAG, "Не удалось инициировать запись дескриптора ${descriptor.uuid}")
                 pendingOperationDeferred = null
                 return@withContext false
             }
@@ -67,32 +68,53 @@ class BleGattQueue(
     }
 
     /**
-     * Помещает операцию записи характеристики в очередь и ожидает onCharacteristicWrite.
+     * Запись характеристики с автоматическим выбором поддерживаемого типа записи.
      */
     suspend fun writeCharacteristic(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         payload: ByteArray,
-        writeType: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        preferredWriteType: Int? = null
     ): Boolean = withContext(dispatcher) {
         mutex.withLock {
+            val props = characteristic.properties
+            val resolvedWriteType = when {
+                preferredWriteType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE &&
+                    (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 -> {
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                }
+                preferredWriteType == BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT &&
+                    (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 -> {
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                }
+                (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 -> {
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                }
+                (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 -> {
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                }
+                else -> BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            }
+
             val deferred = CompletableDeferred<Boolean>()
             pendingOperationDeferred = deferred
 
             val initiated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val status = gatt.writeCharacteristic(characteristic, payload, writeType)
+                val status = gatt.writeCharacteristic(characteristic, payload, resolvedWriteType)
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "writeCharacteristic(${characteristic.uuid}) code=$status, type=$resolvedWriteType")
+                }
                 status == BluetoothGatt.GATT_SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 characteristic.value = payload
                 @Suppress("DEPRECATION")
-                characteristic.writeType = writeType
+                characteristic.writeType = resolvedWriteType
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(characteristic)
             }
 
             if (!initiated) {
-                Log.e(TAG, "Не удалось инициировать запись характеристики ${characteristic.uuid}")
                 pendingOperationDeferred = null
                 return@withContext false
             }
@@ -106,9 +128,6 @@ class BleGattQueue(
         }
     }
 
-    /**
-     * Запрос расширения MTU с блокировкой очереди до ответа onMtuChanged.
-     */
     suspend fun requestMtu(
         gatt: BluetoothGatt,
         mtu: Int
@@ -119,7 +138,6 @@ class BleGattQueue(
 
             val initiated = gatt.requestMtu(mtu)
             if (!initiated) {
-                Log.e(TAG, "Контроллер отклонил запрос MTU: $mtu")
                 pendingOperationDeferred = null
                 return@withContext false
             }
@@ -133,16 +151,10 @@ class BleGattQueue(
         }
     }
 
-    /**
-     * Сигнализирует очереди о получении аппаратного ответа от периферийного устройства.
-     */
     fun notifyOperationCompleted(success: Boolean) {
         pendingOperationDeferred?.complete(success)
     }
 
-    /**
-     * Принудительно очищает и разблокирует очередь при обрыве соединения.
-     */
     fun reset() {
         pendingOperationDeferred?.complete(false)
         pendingOperationDeferred = null
