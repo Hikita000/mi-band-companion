@@ -19,9 +19,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.miband.companion.data.ble.ConnectionState
 import com.miband.companion.data.ble.protocol.MiBandConstants
 import com.miband.companion.data.ble.scanner.ScannedBleDevice
@@ -189,6 +192,8 @@ private fun DashboardTabContent(
     onDisconnectClick: () -> Unit,
     onFindBandClick: () -> Unit
 ) {
+    val clipboardManager = LocalClipboardManager.current
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -196,7 +201,6 @@ private fun DashboardTabContent(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Карточка управления соединением
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(20.dp)
@@ -255,7 +259,6 @@ private fun DashboardTabContent(
             }
         }
 
-        // Виджеты живой телеметрии
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -283,6 +286,42 @@ private fun DashboardTabContent(
             accentColor = ErrorRed,
             modifier = Modifier.fillMaxWidth()
         )
+
+        // Панель живого BLE лога для диагностики рукопожатия
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "BLE Лог (отладка)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    IconButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(uiState.bleLogs.joinToString("\n")))
+                        }
+                    ) {
+                        Icon(imageVector = Icons.Default.ContentCopy, contentDescription = "Копировать лог")
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = if (uiState.bleLogs.isEmpty()) "Нажмите Подключить для записи событий..."
+                    else uiState.bleLogs.takeLast(12).joinToString("\n"),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 
