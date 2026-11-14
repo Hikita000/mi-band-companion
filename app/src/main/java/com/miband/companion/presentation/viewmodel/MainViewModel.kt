@@ -26,9 +26,6 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import java.nio.charset.StandardCharsets
 
-/**
- * Основная модель состояния интерфейса приложения.
- */
 data class MainUiState(
     val macAddress: String = "",
     val authKeyHex: String = MiBandConstants.DEFAULT_AUTH_KEY_HEX,
@@ -42,7 +39,8 @@ data class MainUiState(
     val notificationsEnabled: Boolean = true,
     val hasNotificationPermission: Boolean = false,
     val isScreenMirroringActive: Boolean = false,
-    val statusBannerMessage: String? = null
+    val statusBannerMessage: String? = null,
+    val bleLogs: List<String> = emptyList()
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -65,7 +63,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var serviceObserverJob: Job? = null
 
     init {
-        // Подписка на результаты BLE-сканера
         scanner.isScanning.onEach { scanning ->
             _uiState.value = _uiState.value.copy(isScanning = scanning)
         }.launchIn(viewModelScope)
@@ -74,13 +71,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(scannedDevices = devices)
         }.launchIn(viewModelScope)
 
-        // Периодическая синхронизация с активным экземпляром MiBandBleService
         attachToBleServiceLoop()
     }
 
-    /**
-     * Отслеживает подключение UI к живому фоновому сервису BLE и подписывается на телеметрию.
-     */
     private fun attachToBleServiceLoop() {
         viewModelScope.launch {
             while (true) {
@@ -105,6 +98,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         launch {
                             manager.heartRate.collect { bpm ->
                                 _uiState.value = _uiState.value.copy(heartRate = bpm)
+                            }
+                        }
+                        launch {
+                            manager.debugLogs.collect { logs ->
+                                _uiState.value = _uiState.value.copy(bleLogs = logs)
                             }
                         }
                     }
@@ -170,9 +168,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         connectToBand()
     }
 
-    /**
-     * Запускает Foreground Service и инициирует BLE подключение + Auth Key рукопожатие.
-     */
     fun connectToBand() {
         val state = _uiState.value
         if (state.macAddress.isBlank()) {
@@ -220,9 +215,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = _uiState.value.copy(notificationsEnabled = enabled)
     }
 
-    /**
-     * Отправка тестового системного уведомления на экран браслета для проверки связи.
-     */
     fun sendTestNotificationToBand() {
         viewModelScope.launch {
             val manager = MiBandBleService.activeInstance?.bleManager
@@ -234,7 +226,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val testMessage = "Mi Band Companion\nСвязь установлена! Ключ принят."
             val textBytes = testMessage.toByteArray(StandardCharsets.UTF_8)
             val packet = ByteArray(2 + textBytes.size)
-            packet[0] = 0x09 // Instant Message category
+            packet[0] = 0x09
             packet[1] = 0x01
             System.arraycopy(textBytes, 0, packet, 2, textBytes.size)
 
