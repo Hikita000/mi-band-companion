@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
@@ -28,10 +27,6 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 
-/**
- * Фоновая служба Android для непрерывного удержания BLE-соединения.
- * Предотвращает выгрузку процесса системой при оптимизации энергопотребления (Doze Mode).
- */
 class MiBandBleService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -50,8 +45,8 @@ class MiBandBleService : Service() {
         const val ACTION_VIBRATE = "com.miband.companion.action.VIBRATE"
         const val EXTRA_MAC_ADDRESS = "extra_mac_address"
         const val EXTRA_AUTH_KEY = "extra_auth_key"
+        const val EXTRA_FORCE_PAIR = "extra_force_pair"
 
-        // Статическая ссылка для прямого взаимодействия с NotificationListenerService
         @Volatile
         var activeInstance: MiBandBleService? = null
             private set
@@ -68,7 +63,6 @@ class MiBandBleService : Service() {
         super.onCreate()
         activeInstance = this
 
-        // Активация частичного WakeLock для предотвращения засыпания CPU при обмене BLE пакетами
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MiBandCompanion::BleWakeLock").apply {
             setReferenceCounted(false)
@@ -89,8 +83,9 @@ class MiBandBleService : Service() {
             ACTION_CONNECT -> {
                 val mac = intent.getStringExtra(EXTRA_MAC_ADDRESS)
                 val key = intent.getStringExtra(EXTRA_AUTH_KEY) ?: MiBandConstants.DEFAULT_AUTH_KEY_HEX
+                val forcePair = intent.getBooleanExtra(EXTRA_FORCE_PAIR, false)
                 if (!mac.isNullOrBlank()) {
-                    bleManager?.connect(mac, key)
+                    bleManager?.connect(mac, key, forcePair)
                 }
             }
             ACTION_DISCONNECT -> {
@@ -105,9 +100,6 @@ class MiBandBleService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Отслеживание изменений состояния BLE и обновление системного уведомления в шторке.
-     */
     private fun observeConnectionState() {
         bleManager?.connectionState?.onEach { state ->
             val text = when (state) {
@@ -122,9 +114,6 @@ class MiBandBleService : Service() {
         }?.launchIn(serviceScope)
     }
 
-    /**
-     * Запуск службы в режиме Foreground в строгом соответствии с API Android 14.
-     */
     private fun startForegroundServiceNotification(contentText: String) {
         val notification = buildForegroundNotification(contentText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
