@@ -25,14 +25,12 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
 
-    // Регистрация контракта на запрос разрешений Bluetooth / Локации / Уведомлений
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshSystemPermissionsState()
     }
 
-    // Регистрация контракта системного диалога захвата экрана MediaProjection
     private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -52,7 +50,7 @@ class MainActivity : ComponentActivity() {
 
                 MainScreen(
                     uiState = uiState,
-                    onConnectClick = { viewModel.connectToBand() },
+                    onConnectClick = { viewModel.connectToBand(forcePair = false) },
                     onDisconnectClick = { viewModel.disconnectFromBand() },
                     onFindBandClick = { viewModel.triggerFindBandVibration() },
                     onToggleNotifications = { viewModel.setNotificationsEnabled(it) },
@@ -64,7 +62,8 @@ class MainActivity : ComponentActivity() {
                     onAuthKeyChanged = { viewModel.updateAuthKey(it) },
                     onToggleScan = { viewModel.toggleScan(strictHuamiFilter = false) },
                     onSelectDevice = { viewModel.selectScannedDevice(it) },
-                    onRequestBatteryIgnore = { requestIgnoreBatteryOptimizations() }
+                    onRequestBatteryIgnore = { requestIgnoreBatteryOptimizations() },
+                    onForcePairClick = { viewModel.connectToBand(forcePair = true) }
                 )
             }
         }
@@ -75,9 +74,6 @@ class MainActivity : ComponentActivity() {
         viewModel.refreshSystemPermissionsState()
     }
 
-    /**
-     * Запрашивает весь необходимый набор разрешений в зависимости от версии Android (POCO X6 5G / Android 14).
-     */
     private fun requestRequiredRuntimePermissions() {
         val permissions = mutableListOf<String>()
 
@@ -95,25 +91,16 @@ class MainActivity : ComponentActivity() {
         permissionsLauncher.launch(permissions.toTypedArray())
     }
 
-    /**
-     * Открывает системное окно предоставления доступа службе перехвата уведомлений.
-     */
     private fun openNotificationListenerSettings() {
         val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
         startActivity(intent)
     }
 
-    /**
-     * Инициирует системный запрос разрешения на захват экрана MediaProjection.
-     */
     private fun launchMediaProjectionPrompt() {
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
-    /**
-     * Запрашивает отключение ограничений фоновой работы (критично для HyperOS / MIUI на POCO X6 5G).
-     */
     @SuppressLint("BatteryLife")
     private fun requestIgnoreBatteryOptimizations() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
