@@ -55,7 +55,8 @@ fun MainScreen(
     onAuthKeyChanged: (String) -> Unit,
     onToggleScan: () -> Unit,
     onSelectDevice: (ScannedBleDevice) -> Unit,
-    onRequestBatteryIgnore: () -> Unit
+    onRequestBatteryIgnore: () -> Unit,
+    onForcePairClick: () -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(CompanionTab.DASHBOARD) }
 
@@ -143,7 +144,8 @@ fun MainScreen(
                     onAuthKeyChanged = onAuthKeyChanged,
                     onToggleScan = onToggleScan,
                     onSelectDevice = onSelectDevice,
-                    onRequestBatteryIgnore = onRequestBatteryIgnore
+                    onRequestBatteryIgnore = onRequestBatteryIgnore,
+                    onForcePairClick = onForcePairClick
                 )
             }
         }
@@ -287,7 +289,6 @@ private fun DashboardTabContent(
             modifier = Modifier.fillMaxWidth()
         )
 
-        // Панель живого BLE лога для диагностики рукопожатия
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp)
@@ -314,7 +315,7 @@ private fun DashboardTabContent(
                 Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = if (uiState.bleLogs.isEmpty()) "Нажмите Подключить для записи событий..."
-                    else uiState.bleLogs.takeLast(12).joinToString("\n"),
+                    else uiState.bleLogs.takeLast(14).joinToString("\n"),
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
                     lineHeight = 15.sp,
@@ -506,13 +507,14 @@ private fun SettingsTabContent(
     onAuthKeyChanged: (String) -> Unit,
     onToggleScan: () -> Unit,
     onSelectDevice: (ScannedBleDevice) -> Unit,
-    onRequestBatteryIgnore: () -> Unit
+    onRequestBatteryIgnore: () -> Unit,
+    onForcePairClick: () -> Unit
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         OutlinedTextField(
             value = uiState.authKeyHex,
@@ -563,6 +565,16 @@ private fun SettingsTabContent(
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("Без Doze")
             }
+        }
+
+        OutlinedButton(
+            onClick = onForcePairClick,
+            enabled = uiState.isAuthKeyValid && uiState.macAddress.isNotBlank(),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(imageVector = Icons.Default.Key, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Записать ключ в браслет (Привязка 0x01)")
         }
 
         if (uiState.isScanning) {
